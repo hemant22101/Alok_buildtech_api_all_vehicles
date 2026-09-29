@@ -32,7 +32,7 @@ let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management with automatic re-login
+// Session Management with automatic re-login recovery
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -101,11 +101,8 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Common report runner
-async function executeReport({ resourceId, templateId, objectId, from, to }) {
-  let eid = await getSession();
-  const hardwareMap = await getUnitHardwareMap(eid);
-
+// Fully dynamic report runner - extracts headers automatically from Wialon server
+async function runReport({ resourceId, templateId, objectId, from, to, eid, hardwareMap }) {
   const execParams = {
     reportResourceId: resourceId,
     reportTemplateId: templateId,
@@ -149,35 +146,40 @@ async function executeReport({ resourceId, templateId, objectId, from, to }) {
   const headers = reportTables[0]?.header || [];
   const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
-  const getColVal = (cols, keyword) => {
-    const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
-    return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
-  };
+  // Locate the grouping/vehicle column dynamically
+  const groupingIdx = headers.findIndex(h => /grouping|unit|machine|vehicle/i.test((h || '').trim()));
 
   const cleanRows = rawRows.map(row => {
     const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-    const groupingVal = getColVal(cols, 'Grouping');
-    const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
+    // 1. Identify machine name
+    const machineName = groupingIdx !== -1 && cols[groupingIdx] 
+      ? cols[groupingIdx] 
+      : (row.t || cols[0] || 'Unknown');
     const rawName = String(machineName).trim();
     const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
+    // 2. Resolve Unique ID
     const uniqueId = hardwareMap[rawName.toLowerCase()] 
                   || hardwareMap[normKey] 
                   || (row.i ? hardwareMap[String(row.i)] : null) 
                   || (row.i ? Number(row.i) : null);
 
-    return {
-      "Machine GPS Unique ID": uniqueId,
-      "Grouping": rawName,
-      "Run KM": getColVal(cols, 'Run KM'),
-      "Time Run": getColVal(cols, 'Time Run'),
-      "Fuel Opening": getColVal(cols, 'Fuel Opening'),
-      "Fuel Closing": getColVal(cols, 'Fuel Closing'),
-      "Fuel Consumed": getColVal(cols, 'Fuel Consumed'),
-      "Refulling": getColVal(cols, 'Refulling'),
-      "Parkings": getColVal(cols, 'Parkings') !== "0.00" ? getColVal(cols, 'Parkings') : "0:00:00"
+    // 3. Build object dynamically from server-defined headers
+    const rowObj = {
+      "Machine GPS Unique ID": uniqueId
     };
+
+    headers.forEach((headerName, idx) => {
+      const cleanHeader = (headerName || '').trim();
+      // Skip row numbering columns (№, No, #)
+      if (!cleanHeader || cleanHeader === '№' || cleanHeader.toLowerCase() === 'no') return;
+
+      const rawVal = cols[idx];
+      rowObj[cleanHeader] = (rawVal !== undefined && rawVal !== null && rawVal !== '') ? rawVal : "0.00";
+    });
+
+    return rowObj;
   });
 
   await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
@@ -186,36 +188,56 @@ async function executeReport({ resourceId, templateId, objectId, from, to }) {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
+  res.json({ status: 'online', service: 'Alok Buildtech Multi-Template Fleet API' });
 });
 
-// Dynamic summary endpoint (defaults to Template 12, switchable via ?templateId=3)
-app.get('/api/reports/summary', async (req, res) => {
+// Single URL returning BOTH templates dynamically
+app.get(['/api/reports/all', '/api/reports/summary'], async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
     return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
   }
-
-  const requestedTemplateId = parseInt(req.query.templateId) || 12;
-  const config = TEMPLATE_CONFIGS[requestedTemplateId] || TEMPLATE_CONFIGS[12];
-
-  const resourceId = parseInt(req.query.resourceId) || config.resourceId;
-  const templateId = requestedTemplateId;
-  const objectId   = parseInt(req.query.objectId)   || config.objectId;
 
   const defaultInterval = getTodayISTInterval();
   const from = parseInt(req.query.from) || defaultInterval.from;
   const to   = parseInt(req.query.to)   || defaultInterval.to;
 
   try {
-    const data = await executeReport({ resourceId, templateId, objectId, from, to });
-    res.json(data);
+    let eid = await getSession();
+    const hardwareMap = await getUnitHardwareMap(eid);
+
+    const [template3Rows, template12Rows] = await Promise.all([
+      runReport({
+        resourceId: TEMPLATE_CONFIGS[3].resourceId,
+        templateId: TEMPLATE_CONFIGS[3].templateId,
+        objectId: TEMPLATE_CONFIGS[3].objectId,
+        from,
+        to,
+        eid,
+        hardwareMap
+      }),
+      runReport({
+        resourceId: TEMPLATE_CONFIGS[12].resourceId,
+        templateId: TEMPLATE_CONFIGS[12].templateId,
+        objectId: TEMPLATE_CONFIGS[12].objectId,
+        from,
+        to,
+        eid,
+        hardwareMap
+      })
+    ]);
+
+    res.json({
+      template3: template3Rows,
+      template12: template12Rows
+    });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Dedicated Template 3 endpoint
+// Separate route for Template 3 only
 app.get('/api/reports/template3', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
@@ -225,12 +247,16 @@ app.get('/api/reports/template3', async (req, res) => {
   const to   = parseInt(req.query.to)   || defaultInterval.to;
 
   try {
-    const data = await executeReport({
+    let eid = await getSession();
+    const hardwareMap = await getUnitHardwareMap(eid);
+    const data = await runReport({
       resourceId: TEMPLATE_CONFIGS[3].resourceId,
       templateId: TEMPLATE_CONFIGS[3].templateId,
       objectId: TEMPLATE_CONFIGS[3].objectId,
       from,
-      to
+      to,
+      eid,
+      hardwareMap
     });
     res.json(data);
   } catch (err) {
@@ -238,7 +264,7 @@ app.get('/api/reports/template3', async (req, res) => {
   }
 });
 
-// Dedicated Template 12 endpoint
+// Separate route for Template 12 only
 app.get('/api/reports/template12', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
@@ -248,12 +274,16 @@ app.get('/api/reports/template12', async (req, res) => {
   const to   = parseInt(req.query.to)   || defaultInterval.to;
 
   try {
-    const data = await executeReport({
+    let eid = await getSession();
+    const hardwareMap = await getUnitHardwareMap(eid);
+    const data = await runReport({
       resourceId: TEMPLATE_CONFIGS[12].resourceId,
       templateId: TEMPLATE_CONFIGS[12].templateId,
       objectId: TEMPLATE_CONFIGS[12].objectId,
       from,
-      to
+      to,
+      eid,
+      hardwareMap
     });
     res.json(data);
   } catch (err) {
